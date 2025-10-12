@@ -337,11 +337,15 @@ class Homing:
         self.init_homing(hi, homing_axes)
         needs_rehome = False
         retract_dist = hi.retract_dist
-        sample_retract_dist = hi.sample_retract_dist if hi.positive_dir else -1 * hi.sample_retract_dist
+        sample_retract_dist = (
+            hi.sample_retract_dist
+            if hi.positive_dir
+            else -1 * hi.sample_retract_dist
+        )
         hmove = HomingMove(self.printer, endstops)
 
-        distances = []
         retries = 0
+        distances = []
         drop_result = hi.drop_first_result
 
         startpos = None
@@ -367,7 +371,7 @@ class Homing:
             nonlocal drop_result, distances, retries
             # early return if we don't use samples for homing
             if hi.sample_count == 1:
-                distances.append([0] * len(hmove.distance_elapsed))
+                distances.append([0.0] * len(hmove.distance_elapsed))
                 return
 
             if drop_result:
@@ -376,12 +380,12 @@ class Homing:
                 drop_result = False
             else:
                 if not distances:
-                    result = [0] * len(hmove.distance_elapsed)
+                    result = [0.0] * len(hmove.distance_elapsed)
                 else:
                     result = [
                         distances[-1][i] + dist - sample_retract_dist
                         if i in homing_axes
-                        else 0
+                        else 0.0
                         for i, dist in enumerate(hmove.distance_elapsed)
                     ]
                 for i in homing_axes:
