@@ -5,9 +5,12 @@
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import logging, math
 
+EPS = 0.00000001
+
 FIRST_LAYER_WIDTH_MULTIPLIER = 1.2
 DEFAULT_X_SIZE = 50.0
 DEFAULT_Y_SIZE = 40.0
+DEFAULT_HEIGHT = 50.0
 MAX_YX_SIZE_RATIO = 0.8
 SLOW_NOTCH_SIZE = 10.0
 SEAM_GAP_RATIO = 0.10
@@ -35,15 +38,14 @@ class PATest:
                 raise config.error(
                     "Too large size_y value, maximum is %.3f" % (max_size_y,)
                 )
-        self.height = config.getfloat("height", 50.0, above=0.0)
+        self.height = config.getfloat("height", DEFAULT_HEIGHT, above=0.0)
         self.origin_x = config.getfloat("origin_x", None)
         self.origin_y = config.getfloat("origin_y", None)
         self.layer_height = config.getfloat("layer_height", 0.2, above=0.0)
         self.first_layer_height = config.getfloat(
-            "first_layer_height", 0.2, above=self.layer_height
+            "first_layer_height", 0.2, minval=self.layer_height
         )
         self.perimeters = config.getint("perimeters", 2, minval=1)
-        self.brim_width = config.getfloat("brim_width", 10.0, minval=2.0)
         self.slow_velocity = config.getfloat("slow_velocity", 25.0, above=0.0)
         self.medium_velocity = config.getfloat(
             "medium_velocity", 50.0, above=self.slow_velocity
@@ -57,6 +59,17 @@ class PATest:
         self.fan_speed = config.getfloat(
             "fan_speed", 0.5, minval=0.0, maxval=1.0
         )
+        self.brim_width = config.getfloat(
+            "brim_width", 10.0, minval=2.0
+        )
+        self.brim_velocity = config.getfloat(
+            "brim_velocity", self.slow_velocity, above=0.0
+        )
+        _gm = self.printer.load_object(config, "gcode_macro")
+        self.start_gcode = _gm.load_template(config, "start_gcode", "")
+        self.stack_gcode = _gm.load_template(config, "stack_gcode", "")
+        self.end_gcode = _gm.load_template(config, "end_gcode", "")
+
         # Register commands
         self.gcode = self.printer.lookup_object("gcode")
         self.gcode.register_command(
@@ -133,6 +146,18 @@ class PATest:
     def reset(self):
         self.progress = 0.0
 
+    def render_template_lines(self, template, extra_context):
+        template_context = template.create_template_context()
+        template_context.update({
+            "rawparams": self.gcmd.get_raw_command_parameters(),
+            "params": dict(self.gcmd.get_command_parameters()),
+            "pa_test": extra_context,
+        })
+        script = template.render(template_context).strip()
+        if not script:
+            return []
+        return [line.strip() for line in script.splitlines() if line.strip()]
+
     def get_gcode(self):
         gcmd = self.gcmd
         nozzle = gcmd.get_float("NOZZLE")
@@ -142,16 +167,8 @@ class PATest:
         toolhead = self.printer.lookup_object("toolhead")
         extruder_heater = toolhead.get_extruder().get_heater()
         systime = self.printer.get_reactor().monotonic()
-        heater_status = extruder_heater.get_status(systime)
-        if target_temp != heater_status["target"]:
-            raise gcmd.error(
-                "Extruder target temp %.1f does not match the expected "
-                "TARGET_TEMP=%.1f. Make sure to preheat the nozzle to "
-                "the expected temperature (e.g. with M109 gcode in a "
-                "gcode_macro prior to calling PRINT_PA_TOWER)"
-                % (heater_status["target"], target_temp)
-            )
         toolhead_status = toolhead.get_status(systime)
+        kin_status = toolhead.get_kinematics().get_status(systime)
 
         # Get tower params with overrides from the GCode command
         origin_x = gcmd.get_float("ORIGIN_X", self.origin_x)
@@ -185,19 +202,46 @@ class PATest:
             "LAYER_HEIGHT", self.layer_height, above=0.0
         )
         first_layer_height = gcmd.get_float(
-            "FIRST_LAYER_HEIGHT", self.first_layer_height, above=layer_height
+            "FIRST_LAYER_HEIGHT", self.first_layer_height, minval=layer_height
+        )
+        fan_speed = gcmd.get_float(
+            "FAN_SPEED", self.fan_speed, minval=0.0, maxval=1.0
         )
         height = gcmd.get_float("HEIGHT", self.height, above=0.0)
         step_height = gcmd.get_float("STEP_HEIGHT", 0.0, minval=0.0)
-        brim_width = gcmd.get_float("BRIM_WIDTH", self.brim_width, above=nozzle)
+        brim_width = gcmd.get_float("BRIM_WIDTH", self.brim_width, minval=nozzle)
+        brim_velocity = gcmd.get_float("BRIM_VELOCITY", self.brim_velocity, above=0.0)
         final_gcode_id = gcmd.get("FINAL_GCODE_ID", None)
+        stack_count = gcmd.get_int("STACK_COUNT", 1, minval=1)
+        total_height = height * stack_count
+        _z_max = kin_status['axis_maximum'].z
+        if total_height > _z_max:
+            raise gcmd.error('tower stack of %.fmm will not fit within %.fmm max height' 
+                             % (total_height, _z_max))
 
         logging.info(
             "Starting PA tower print of size %.3f x %.3f x %.3f mm"
             " at (%.3f,%.3f)" % (size_x, size_y, height, origin_x, origin_y)
         )
+        if stack_count > 1:
+            logging.info("PA tower stacking enabled: stack_count=%d, total_height=%.3f mm" 
+                         % (stack_count, total_height))
         inner_size_x = size_x - 2 * nozzle * perimeters
         inner_size_y = size_y - 2 * nozzle * perimeters
+
+        template_extra_context = {
+            "origin_x": origin_x, "origin_y": origin_y,
+            "size_x": size_x, "size_y": size_y,
+            "height": height, "total_height": total_height,
+            "layer_height": layer_height, "first_layer_height": first_layer_height, 
+            "step_height": step_height, "stack_count": stack_count,
+            "slow_velocity": slow_velocity, "medium_velocity": medium_velocity, "fast_velocity": fast_velocity, 
+            "scv_velocity": scv_velocity, "perimeters": perimeters, 
+            "filament_diameter": filament_diameter, 
+            "fan_speed": fan_speed, 
+            "nozzle": nozzle, "target_temp": target_temp,
+            "brim_width": brim_width, "brim_velocity": brim_velocity,
+        }
 
         def gen_brim():
             first_layer_width = nozzle * FIRST_LAYER_WIDTH_MULTIPLIER
@@ -259,14 +303,16 @@ class PATest:
                 brim_x_offset * extr_r,
                 slow_velocity * 60.0,
             )
-            self.progress = start_z / height
+            self.progress = start_z / total_height
 
         def gen_tower():
             last_z = first_layer_height
             z = first_layer_height + layer_height
             x_switching_pos = size_x / 3.0
             fast_notch_size = size_y - 2.0 * SLOW_NOTCH_SIZE
-            while z < height - 0.00000001:
+            section_end_z = height
+            section_index = 0
+            while z < total_height - EPS:
                 line_width = nozzle
                 perimeter_x_offset = 0.5 * inner_size_x
                 perimeter_y_offset = 0.5 * inner_size_y
@@ -428,17 +474,51 @@ class PATest:
                             origin_y + perimeter_y_offset,
                             fast_velocity * 60.0,
                         )
-                self.progress = z / height
+                self.progress = min(z / total_height, 1.0)
+                if (
+                    stack_count > 1
+                    and z >= section_end_z - EPS
+                    and section_index < stack_count - 1
+                ):
+                    section_index += 1
+                    section_end_z += height
+                    stack_context = {
+                        "stack_index": section_index,
+                        "section_height": height,
+                    }
+                    for line in self.render_template_lines(
+                        self.stack_gcode, {
+                            **stack_context,
+                            **template_extra_context,
+                        }
+                    ):
+                        yield line
                 last_z = z
                 z += layer_height
 
+        for line in self.render_template_lines(
+            self.start_gcode, template_extra_context):
+                yield line
         yield "M83"
         yield "G90"
+        yield "M400"
+        heater_status = extruder_heater.get_status(self.printer.get_reactor().monotonic())
+        if target_temp != heater_status["target"]:
+            raise gcmd.error(
+                "Extruder target temp %.1f does not match the expected "
+                "TARGET_TEMP=%.1f. Make sure to preheat the nozzle to "
+                "the expected temperature (e.g. with M109 gcode in a "
+                "gcode_macro prior to calling PRINT_PA_TOWER)"
+                % (heater_status["target"], target_temp)
+            )
         for line in gen_brim():
             yield line
-        yield f"M106 S{self.fan_speed * 255}"
+        yield f"M106 S{fan_speed * 255}"
         for line in gen_tower():
             yield line
+        for line in self.render_template_lines(
+            self.end_gcode, template_extra_context):
+                yield line
         if final_gcode_id is not None:
             yield "UPDATE_DELAYED_GCODE ID='%s' DURATION=0.01" % (
                 final_gcode_id,
