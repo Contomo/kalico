@@ -1,7 +1,7 @@
-// Kinematic input shapers to minimize motion vibrations in XY plane
+// Kinematic input shapers to minimize motion vibrations in XYZ space
 //
 // Copyright (C) 2019-2020  Kevin O'Connor <kevin@koconnor.net>
-// Copyright (C) 2020  Dmitry Butyugin <dmbutyugin@google.com>
+// Copyright (C) 2020-2025  Dmitry Butyugin <dmbutyugin@google.com>
 //
 // This file may be distributed under the terms of the GNU GPLv3 license.
 
@@ -20,6 +20,7 @@
  * Shaper initialization
  ****************************************************************/
 
+static const int KIN_FLAGS[3] = { AF_X, AF_Y, AF_Z };
 // Shift pulses around 'mid-point' t=0 so that the input shaper is an identity
 // transformation for constant-speed motion (i.e. input_shaper(v * T) = v * T)
 static void
@@ -177,7 +178,7 @@ struct input_shaper {
     struct stepper_kinematics sk;
     struct stepper_kinematics *orig_sk;
     struct move m;
-    struct shaper_pulses sp_x, sp_y;
+    struct shaper_pulses sp_x, sp_y, sp_z;
     struct smoother sm_x, sm_y;
 };
 
@@ -209,7 +210,19 @@ shaper_y_calc_position(struct stepper_kinematics *sk, struct move *m
     return is->orig_sk->calc_position_cb(is->orig_sk, &is->m, DUMMY_T);
 }
 
-// General calc_position for both x and y axes
+// Optimized calc_position when only z axis is needed
+static double
+shaper_z_calc_position(struct stepper_kinematics *sk, struct move *m
+                       , double move_time)
+{
+    struct input_shaper *is = container_of(sk, struct input_shaper, sk);
+    if (!is->sp_z.num_pulses)
+        return is->orig_sk->calc_position_cb(is->orig_sk, m, move_time);
+    is->m.start_pos.z = shaper_calc_position(m, 'z', move_time, &is->sp_z);
+    return is->orig_sk->calc_position_cb(is->orig_sk, &is->m, DUMMY_T);
+}
+
+// General calc_position when both x and y axes are needed
 static double
 shaper_xy_calc_position(struct stepper_kinematics *sk, struct move *m
                         , double move_time)
@@ -230,6 +243,29 @@ shaper_xy_calc_position(struct stepper_kinematics *sk, struct move *m
     return is->orig_sk->calc_position_cb(is->orig_sk, &is->m, DUMMY_T);
 }
 
+// General calc_position when x, y, and z axes may be needed
+static double
+shaper_xyz_calc_position(struct stepper_kinematics *sk, struct move *m
+                         , double move_time)
+{
+    struct input_shaper *is = container_of(sk, struct input_shaper, sk);
+    if (!is->sp_x.num_pulses && !is->sp_y.num_pulses && !is->sp_z.num_pulses
+            && !is->sm_x.hst && !is->sm_y.hst)
+        return is->orig_sk->calc_position_cb(is->orig_sk, m, move_time);
+    is->m.start_pos = move_get_coord(m, move_time);
+    if (is->sp_x.num_pulses || is->sm_x.hst)
+        is->m.start_pos.x = is->sp_x.num_pulses
+            ?   shaper_calc_position(m, 'x', move_time, &is->sp_x)
+            : smoother_calc_position(m, 'x', move_time, &is->sm_x);
+    if (is->sp_y.num_pulses || is->sm_y.hst)
+        is->m.start_pos.y = is->sp_y.num_pulses
+            ?   shaper_calc_position(m, 'y', move_time, &is->sp_y)
+            : smoother_calc_position(m, 'y', move_time, &is->sm_y);
+    if (is->sp_z.num_pulses)
+        is->m.start_pos.z = shaper_calc_position(m, 'z', move_time, &is->sp_z);
+    return is->orig_sk->calc_position_cb(is->orig_sk, &is->m, DUMMY_T);
+}
+
 // A callback that forwards post_cb call to the original kinematics
 static void
 shaper_commanded_pos_post_fixup(struct stepper_kinematics *sk)
@@ -238,30 +274,6 @@ shaper_commanded_pos_post_fixup(struct stepper_kinematics *sk)
     is->orig_sk->commanded_pos = sk->commanded_pos;
     is->orig_sk->post_cb(is->orig_sk);
     sk->commanded_pos = is->orig_sk->commanded_pos;
-}
-
-int __visible
-input_shaper_set_sk(struct stepper_kinematics *sk
-                    , struct stepper_kinematics *orig_sk)
-{
-    struct input_shaper *is = container_of(sk, struct input_shaper, sk);
-    if (orig_sk->active_flags == AF_X)
-        is->sk.calc_position_cb = shaper_x_calc_position;
-    else if (orig_sk->active_flags == AF_Y)
-        is->sk.calc_position_cb = shaper_y_calc_position;
-    else if (orig_sk->active_flags & (AF_X | AF_Y))
-        is->sk.calc_position_cb = shaper_xy_calc_position;
-    else
-        return -1;
-    is->sk.active_flags = orig_sk->active_flags;
-    is->orig_sk = orig_sk;
-    is->sk.commanded_pos = orig_sk->commanded_pos;
-    is->sk.last_flush_time = orig_sk->last_flush_time;
-    is->sk.last_move_time = orig_sk->last_move_time;
-    if (orig_sk->post_cb) {
-        is->sk.post_cb = shaper_commanded_pos_post_fixup;
-    }
-    return 0;
 }
 
 static void
@@ -278,34 +290,107 @@ shaper_note_generation_time(struct input_shaper *is)
         if (post_active < 0.) post_active = 0.;
     }
     if ((is->sk.active_flags & AF_Y) && is->sp_y.num_pulses) {
-        pre_active = is->sp_y.pulses[is->sp_y.num_pulses-1].t > pre_active
-            ? is->sp_y.pulses[is->sp_y.num_pulses-1].t : pre_active;
-        post_active = -is->sp_y.pulses[0].t > post_active
-            ? -is->sp_y.pulses[0].t : post_active;
+        double pre = is->sp_y.pulses[is->sp_y.num_pulses-1].t;
+        if (pre > pre_active)
+            pre_active = pre;
+        double post = -is->sp_y.pulses[0].t;
+        if (post > post_active)
+            post_active = post;
     } else if ((is->sk.active_flags & AF_Y) && is->sm_y.hst) {
-        pre_active = is->sm_y.hst + is->sm_y.t_offs > pre_active
-            ? is->sm_y.hst + is->sm_y.t_offs : pre_active;
-        post_active = is->sm_y.hst - is->sm_y.t_offs > post_active
-            ? is->sm_y.hst - is->sm_y.t_offs : post_active;
+        double pre = is->sm_y.hst + is->sm_y.t_offs;
+        if (pre > pre_active)
+            pre_active = pre;
+        double post = is->sm_y.hst - is->sm_y.t_offs;
+        if (post > post_active)
+            post_active = post;
+    }
+    if ((is->sk.active_flags & AF_Z) && is->sp_z.num_pulses) {
+        double pre = is->sp_z.pulses[is->sp_z.num_pulses-1].t;
+        double post = -is->sp_z.pulses[0].t;
+        if (pre > pre_active)
+            pre_active = pre;
+        if (post > post_active)
+            post_active = post;
     }
     is->sk.gen_steps_pre_active = pre_active;
     is->sk.gen_steps_post_active = post_active;
+}
+
+void __visible
+input_shaper_update_sk(struct stepper_kinematics *sk)
+{
+    struct input_shaper *is = container_of(sk, struct input_shaper, sk);
+    int kin_flags = is->orig_sk->active_flags & (AF_X | AF_Y | AF_Z);
+    if (kin_flags == AF_X)
+        is->sk.calc_position_cb = shaper_x_calc_position;
+    else if (kin_flags == AF_Y)
+        is->sk.calc_position_cb = shaper_y_calc_position;
+    else if (kin_flags == AF_Z)
+        is->sk.calc_position_cb = shaper_z_calc_position;
+    else if (kin_flags == (AF_X | AF_Y))
+        is->sk.calc_position_cb = shaper_xy_calc_position;
+    else
+        is->sk.calc_position_cb = shaper_xyz_calc_position;
+    is->sk.active_flags = is->orig_sk->active_flags;
+    shaper_note_generation_time(is);
+}
+
+int __visible
+input_shaper_set_sk(struct stepper_kinematics *sk
+                    , struct stepper_kinematics *orig_sk)
+{
+    struct input_shaper *is = container_of(sk, struct input_shaper, sk);
+    int kin_flags = orig_sk->active_flags & (AF_X | AF_Y | AF_Z);
+    if (kin_flags == AF_X)
+        is->sk.calc_position_cb = shaper_x_calc_position;
+    else if (kin_flags == AF_Y)
+        is->sk.calc_position_cb = shaper_y_calc_position;
+    else if (kin_flags == AF_Z)
+        is->sk.calc_position_cb = shaper_z_calc_position;
+    else if (kin_flags == (AF_X | AF_Y))
+        is->sk.calc_position_cb = shaper_xy_calc_position;
+    else if (kin_flags)
+        is->sk.calc_position_cb = shaper_xyz_calc_position;
+    else
+        return -1;
+    is->sk.active_flags = orig_sk->active_flags;
+    is->orig_sk = orig_sk;
+    is->sk.commanded_pos = orig_sk->commanded_pos;
+    is->sk.last_flush_time = orig_sk->last_flush_time;
+    is->sk.last_move_time = orig_sk->last_move_time;
+    if (orig_sk->post_cb) {
+        is->sk.post_cb = shaper_commanded_pos_post_fixup;
+    }
+    return 0;
 }
 
 int __visible
 input_shaper_set_shaper_params(struct stepper_kinematics *sk, char axis
                                , int n, double a[], double t[])
 {
-    if (axis != 'x' && axis != 'y')
+    int axis_ind = axis-'x';
+    if (axis_ind < 0 || axis_ind >= ARRAY_SIZE(KIN_FLAGS))
         return -1;
     struct input_shaper *is = container_of(sk, struct input_shaper, sk);
-    struct shaper_pulses *sp = axis == 'x' ? &is->sp_x : &is->sp_y;
-    struct smoother *sm = axis == 'x' ? &is->sm_x : &is->sm_y;
+    struct shaper_pulses *sp;
+    struct smoother *sm = NULL;
+    if (axis == 'x') {
+        sp = &is->sp_x;
+        sm = &is->sm_x;
+    } else if (axis == 'y') {
+        sp = &is->sp_y;
+        sm = &is->sm_y;
+    } else if (axis == 'z') {
+        sp = &is->sp_z;
+    } else {
+        return -1;
+    }
     int status = 0;
     // Ignore input shaper update if the axis is not active
-    if (is->orig_sk->active_flags & (axis == 'x' ? AF_X : AF_Y)) {
+    if (is->orig_sk->active_flags & KIN_FLAGS[axis_ind]) {
         status = init_shaper(n, a, t, sp);
-        memset(sm, 0, sizeof(*sm));
+        if (sm)
+            memset(sm, 0, sizeof(*sm));
         shaper_note_generation_time(is);
     }
     return status;
