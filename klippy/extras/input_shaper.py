@@ -184,6 +184,8 @@ class AxisInputShaper:
         return self.params.get_axis()
 
     def is_extruder_smoothing(self, exact_mode):
+        if self.get_axis() == "z":
+            return False
         return not exact_mode and self.A
 
     def is_enabled(self):
@@ -213,6 +215,9 @@ class AxisInputShaper:
     def update_extruder_kinematics(self, sk, exact_mode):
         ffi_main, ffi_lib = chelper.get_ffi()
         axis = self.get_axis().encode()
+        if axis == b"z":
+            # Extruders do not implement Z-axis shaping
+            return True
         if not self.is_extruder_smoothing(exact_mode):
             # Make sure to disable any active input smoothing
             coeffs, smooth_time = [], 0.0
