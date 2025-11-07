@@ -160,6 +160,12 @@ class ResonanceTestExecutor:
         toolhead = self.printer.lookup_object('toolhead')
         tpos = toolhead.get_position()
         X, Y, Z = tpos[:3]
+        def _set_toolhead_accel(accel_value):
+            toolhead.max_accel = accel_value
+            toolhead.max_accel_to_decel = accel_value * (
+                1.0 - toolhead.min_cruise_ratio
+            )
+            toolhead._calc_junction_deviation()
         # Override maximum acceleration and acceleration to
         # deceleration based on the maximum test frequency
         systime = reactor.monotonic()
@@ -214,7 +220,7 @@ class ResonanceTestExecutor:
                 half_inv_accel = 0.
                 d = v * t_seg
             else:
-                toolhead.set_max_velocities(None, abs(accel), None, None)
+                _set_toolhead_accel(abs(accel))
                 v = last_v + accel * t_seg
                 abs_v = abs(v)
                 if abs_v < 0.000001:
@@ -245,7 +251,7 @@ class ResonanceTestExecutor:
         if last_v:
             d_decel = -.5 * last_v2 / old_max_accel
             decel_X, decel_Y, decel_Z = axis.get_point(d_decel)
-            toolhead.set_max_velocities(None, old_max_accel, None, None)
+            _set_toolhead_accel(old_max_accel)
             toolhead.move([X + decel_X, Y + decel_Y, Z + decel_Z] + tpos[3:],
                           abs(last_v))
         # Restore the original acceleration values
