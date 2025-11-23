@@ -507,6 +507,12 @@ class ShaperFactory:
                 TypedInputShaperParams(axis, type_name, config)
             )
         if type_name in TypedInputSmootherParams.smoothers:
+            if axis == "z":
+                if config is not None:
+                    raise config.error(
+                        "Input smoothing is only available for X/Y axes"
+                    )
+                return None
             return AxisInputSmoother(
                 TypedInputSmootherParams(axis, type_name, config)
             )
