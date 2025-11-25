@@ -137,6 +137,8 @@ class SweepingVibrationsTestGenerator:
         return res
     def get_max_freq(self):
         return self.vibration_generator.get_max_freq()
+    def get_test_accel_per_hz(self):
+        return getattr(self.vibration_generator, 'test_accel_per_hz', None)
 
 # Helper to lookup Z kinematics limits
 def lookup_z_limits(configfile):
@@ -161,11 +163,17 @@ class ResonanceTestExecutor:
         tpos = toolhead.get_position()
         X, Y, Z = tpos[:3]
         def _set_toolhead_accel(accel_value):
-            toolhead.max_accel = accel_value
-            toolhead.max_accel_to_decel = accel_value * (
-                1.0 - toolhead.min_cruise_ratio
-            )
-            toolhead._calc_junction_deviation()
+            # Upstream uses toolhead.set_max_velocities(); older builds
+            # don't have it, so fall back to directly tweaking limits.
+            set_max = getattr(toolhead, 'set_max_velocities', None)
+            if set_max:
+                set_max(None, accel_value, None, None)
+            else:
+                toolhead.max_accel = accel_value
+                toolhead.max_accel_to_decel = accel_value * (
+                    1.0 - toolhead.min_cruise_ratio
+                )
+                toolhead._calc_junction_deviation()
         # Override maximum acceleration and acceleration to
         # deceleration based on the maximum test frequency
         systime = reactor.monotonic()
@@ -439,7 +447,8 @@ class ResonanceTester:
         if csv_output:
             csv_name = self.save_calibration_data(
                     'resonances', name_suffix, helper, axis, data,
-                    point=test_point, max_freq=self._get_max_calibration_freq())
+                    point=test_point, max_freq=self._get_max_calibration_freq(),
+                    accel_per_hz=self.generator.get_test_accel_per_hz())
             gcmd.respond_info(
                     "Resonances data written to %s file" % (csv_name,))
     cmd_SHAPER_CALIBRATE_help = (
@@ -497,7 +506,8 @@ class ResonanceTester:
                                best_shaper.name, best_shaper.freq)
             csv_name = self.save_calibration_data(
                     'calibration_data', name_suffix, helper, axis,
-                    calibration_data[axis], all_shapers, max_freq=max_freq)
+                    calibration_data[axis], all_shapers, max_freq=max_freq,
+                    accel_per_hz=self.generator.get_test_accel_per_hz())
             gcmd.respond_info(
                     "Shaper calibration data written to %s file" % (csv_name,))
         gcmd.respond_info(
@@ -543,10 +553,12 @@ class ResonanceTester:
 
     def save_calibration_data(self, base_name, name_suffix, shaper_calibrate,
                               axis, calibration_data,
-                              all_shapers=None, point=None, max_freq=None):
+                              all_shapers=None, point=None, max_freq=None,
+                              accel_per_hz=None):
         output = self.get_filename(base_name, name_suffix, axis, point)
-        shaper_calibrate.save_calibration_data(output, calibration_data,
-                                               all_shapers, max_freq)
+        shaper_calibrate.save_calibration_data(
+                output, calibration_data, all_shapers, max_freq,
+                accel_per_hz=accel_per_hz)
         return output
 
 def load_config(config):

@@ -682,6 +682,7 @@ class ShaperCalibrate:
     ):
         try:
             max_freq = max_freq or MAX_FREQ
+            accel_value = accel_per_hz if accel_per_hz is not None else 0.0
             with open(output, "w") as csvfile:
                 csvfile.write("freq,psd_x,psd_y,psd_z,psd_xyz,accel_per_hz")
                 if shapers:
@@ -700,7 +701,7 @@ class ShaperCalibrate:
                             calibration_data.psd_y[i],
                             calibration_data.psd_z[i],
                             calibration_data.psd_sum[i],
-                            accel_per_hz,
+                            accel_value,
                         )
                     )
                     if shapers:
